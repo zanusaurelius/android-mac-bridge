@@ -1,6 +1,6 @@
 # Android Mac Bridge
 
-A native macOS app for transferring files between your Android phone and Mac over USB — in both directions. No Google account, no cloud, no extra software to install.
+A native macOS app for transferring files between your Android phone and Mac over USB — in both directions. No accounts, no cloud, and no more unreliable android transfer apps.
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
