@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-APP="AndroidTransfer"
+APP="AndroidMacBridge"
 BUILD="build"
 
 rm -rf "$BUILD"
