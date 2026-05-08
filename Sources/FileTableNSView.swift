@@ -11,10 +11,15 @@ private struct FlatRow {
 struct FileTableNSView: NSViewRepresentable {
     let files: [FileItem]
     let adbPath: String
+    let sortField: SortField
+    let sortAscending: Bool
     @Binding var selectedFileIDs: Set<FileItem.ID>
     let onNavigate: (FileItem) -> Void
     let onPreview: (FileItem) -> Void
     let onDrop: ([NSItemProvider]) -> Bool
+    let onCreateFolder: () -> Void
+    let onDelete: ([FileItem]) -> Void
+    let onSortChange: (SortField, Bool) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -24,6 +29,7 @@ struct FileTableNSView: NSViewRepresentable {
         let nameCol = NSTableColumn(identifier: .init("name"))
         nameCol.title = "Name"
         nameCol.minWidth = 180
+        nameCol.sortDescriptorPrototype = NSSortDescriptor(key: "name", ascending: true)
         tv.addTableColumn(nameCol)
 
         let dateCol = NSTableColumn(identifier: .init("date"))
@@ -31,6 +37,7 @@ struct FileTableNSView: NSViewRepresentable {
         dateCol.width = 130
         dateCol.minWidth = 100
         dateCol.maxWidth = 160
+        dateCol.sortDescriptorPrototype = NSSortDescriptor(key: "date", ascending: true)
         tv.addTableColumn(dateCol)
 
         let sizeCol = NSTableColumn(identifier: .init("size"))
@@ -38,6 +45,7 @@ struct FileTableNSView: NSViewRepresentable {
         sizeCol.width = 65
         sizeCol.minWidth = 55
         sizeCol.maxWidth = 90
+        sizeCol.sortDescriptorPrototype = NSSortDescriptor(key: "size", ascending: true)
         tv.addTableColumn(sizeCol)
 
         let sv = NSScrollView()
@@ -52,6 +60,7 @@ struct FileTableNSView: NSViewRepresentable {
         context.coordinator.parent = self
         let tv = scrollView.documentView as! NSTableView
         context.coordinator.sync(files: files, selectedIDs: selectedFileIDs, in: tv)
+        context.coordinator.syncSort(field: sortField, ascending: sortAscending, in: tv)
     }
 
     // MARK: - Coordinator
@@ -70,6 +79,25 @@ struct FileTableNSView: NSViewRepresentable {
         private var childCache: [String: [FileItem]] = [:]
         private var loadingPaths: Set<String> = []
         private var suppressSelectionCallback = false
+        private var suppressSortCallback = false
+        private var lastSortKey: String = "name"
+        private var lastSortAscending: Bool = true
+        private var sortKVO: NSKeyValueObservation?
+
+        func syncSort(field: SortField, ascending: Bool, in tv: NSTableView) {
+            let key: String
+            switch field {
+            case .name: key = "name"
+            case .date: key = "date"
+            case .size: key = "size"
+            }
+            guard key != lastSortKey || ascending != lastSortAscending else { return }
+            lastSortKey = key
+            lastSortAscending = ascending
+            suppressSortCallback = true
+            tv.sortDescriptors = [NSSortDescriptor(key: key, ascending: ascending)]
+            suppressSortCallback = false
+        }
 
         lazy var operationQueue: OperationQueue = {
             let q = OperationQueue()
@@ -85,6 +113,21 @@ struct FileTableNSView: NSViewRepresentable {
             tableView.dataSource = self
             tableView.target = self
             tableView.doubleAction = #selector(doubleClicked)
+
+            sortKVO = tableView.observe(\.sortDescriptors, options: [.new]) { [weak self] tv, _ in
+                guard let self, !self.suppressSortCallback,
+                      let first = tv.sortDescriptors.first, let key = first.key else { return }
+                let field: SortField
+                switch key {
+                case "name": field = .name
+                case "date": field = .date
+                case "size": field = .size
+                default: return
+                }
+                self.lastSortKey = key
+                self.lastSortAscending = first.ascending
+                self.parent.onSortChange(field, first.ascending)
+            }
             tableView.usesAlternatingRowBackgroundColors = true
             tableView.allowsMultipleSelection = true
             tableView.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
@@ -92,6 +135,34 @@ struct FileTableNSView: NSViewRepresentable {
             tableView.registerForDraggedTypes(
                 NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) } + [.fileURL]
             )
+
+            let menu = NSMenu()
+            let newFolderItem = NSMenuItem(title: "New Folder", action: #selector(newFolderMenuClicked), keyEquivalent: "")
+            newFolderItem.target = self
+            menu.addItem(newFolderItem)
+            menu.addItem(NSMenuItem.separator())
+            let deleteItem = NSMenuItem(title: "Delete", action: #selector(deleteMenuClicked), keyEquivalent: "")
+            deleteItem.target = self
+            menu.addItem(deleteItem)
+            tableView.menu = menu
+        }
+
+        @objc func newFolderMenuClicked() {
+            DispatchQueue.main.async { self.parent.onCreateFolder() }
+        }
+
+        @objc func deleteMenuClicked() {
+            let clicked = tableView.clickedRow
+            guard clicked >= 0, clicked < flatRows.count else { return }
+            let files: [FileItem]
+            if tableView.selectedRowIndexes.contains(clicked) {
+                files = tableView.selectedRowIndexes.compactMap { row in
+                    row < flatRows.count ? flatRows[row].file : nil
+                }
+            } else {
+                files = [flatRows[clicked].file]
+            }
+            DispatchQueue.main.async { self.parent.onDelete(files) }
         }
 
         // Rebuild the flat row list from baseFiles, recursively inserting children
@@ -127,6 +198,7 @@ struct FileTableNSView: NSViewRepresentable {
             if tv.selectedRowIndexes != wanted {
                 suppressSelectionCallback = true
                 tv.selectRowIndexes(wanted, byExtendingSelection: false)
+                if let row = wanted.first { tv.scrollRowToVisible(row) }
                 suppressSelectionCallback = false
             }
         }
@@ -135,6 +207,7 @@ struct FileTableNSView: NSViewRepresentable {
             let wanted = IndexSet(selectedIDs.compactMap { id in flatRows.firstIndex { $0.file.id == id } })
             suppressSelectionCallback = true
             tv.selectRowIndexes(wanted, byExtendingSelection: false)
+            if let row = wanted.first { tv.scrollRowToVisible(row) }
             suppressSelectionCallback = false
         }
 

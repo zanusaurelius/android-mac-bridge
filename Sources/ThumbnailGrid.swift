@@ -11,6 +11,8 @@ struct ThumbnailGrid: View {
     @Binding var isDropTargeted: Bool
     let onNavigate: (FileItem) -> Void
     let onDrop: ([NSItemProvider]) -> Bool
+    let onCreateFolder: () -> Void
+    let onDelete: ([FileItem]) -> Void
 
     private let columns = [GridItem(.adaptive(minimum: 130, maximum: 170), spacing: 10)]
 
@@ -40,6 +42,16 @@ struct ThumbnailGrid: View {
         }
         .overlay(dropHighlight)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: onDrop)
+        .contextMenu {
+            Button("New Folder") { onCreateFolder() }
+            if !selectedFileIDs.isEmpty {
+                Divider()
+                Button("Delete", role: .destructive) {
+                    let selected = files.filter { selectedFileIDs.contains($0.id) }
+                    onDelete(selected)
+                }
+            }
+        }
     }
 
     @ViewBuilder

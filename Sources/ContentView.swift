@@ -29,6 +29,12 @@ struct ContentView: View {
     @State private var previewURL: URL? = nil
     @State private var keyMonitor: Any? = nil
     @State private var showHelp = false
+    @State private var loadingTask: Task<Void, Never>? = nil
+    @State private var showNewFolderAlert = false
+    @State private var newFolderName = ""
+    @State private var showDeleteConfirmation = false
+    @State private var pendingDeleteFiles: [FileItem] = []
+    @State private var pendingDeleteNextFile: FileItem? = nil
 
     // Drives Table column-header sort indicators; stays in sync with sortField/sortAscending
     @State private var tableSortOrder: [KeyPathComparator<FileItem>] = [
@@ -79,6 +85,20 @@ struct ContentView: View {
         }
     }
 
+    var deleteAlertTitle: String {
+        if pendingDeleteFiles.count == 1 {
+            return "Delete \"\(pendingDeleteFiles.first?.name ?? "")\"?"
+        }
+        return "Delete \(pendingDeleteFiles.count) items?"
+    }
+
+    var deleteAlertMessage: String {
+        if pendingDeleteFiles.count == 1 {
+            return "\"\(pendingDeleteFiles.first?.name ?? "")\" will be permanently deleted from your device."
+        }
+        return "\(pendingDeleteFiles.count) items will be permanently deleted from your device."
+    }
+
     var sortAscendingLabel: String {
         switch sortField {
         case .name: return sortAscending ? "A→Z" : "Z→A"
@@ -127,7 +147,7 @@ struct ContentView: View {
         .task { await pollForDevice() }
         .onChange(of: adb.isConnected) { _, connected in
             if connected {
-                Task { await loadFiles(currentPath) }
+                loadFiles(currentPath)
             } else {
                 files = []
                 pathHistory = []
@@ -144,6 +164,47 @@ struct ContentView: View {
         }
         .onAppear { setupKeyMonitor() }
         .onDisappear { if let m = keyMonitor { NSEvent.removeMonitor(m) } }
+        .alert(deleteAlertTitle, isPresented: $showDeleteConfirmation) {
+            Button("Delete", role: .destructive) {
+                let filesToDelete = pendingDeleteFiles
+                let nextFile = pendingDeleteNextFile
+                let wasPreviewOpen = previewURL != nil
+                pendingDeleteFiles = []
+                pendingDeleteNextFile = nil
+                Task {
+                    let ok = await adb.deleteFiles(filesToDelete.map(\.path))
+                    let n = filesToDelete.count
+                    showStatus(ok ? "Deleted \(n) item\(n == 1 ? "" : "s")"
+                                 : "Some items could not be deleted")
+                    if wasPreviewOpen { previewURL = nil }
+                    if let next = nextFile {
+                        selectedFileIDs = [next.id]
+                        if wasPreviewOpen { await showPreview(for: next) }
+                    } else {
+                        selectedFileIDs = []
+                    }
+                    loadFiles(currentPath)
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingDeleteFiles = []; pendingDeleteNextFile = nil }
+        } message: {
+            Text(deleteAlertMessage)
+        }
+        .alert("New Folder", isPresented: $showNewFolderAlert) {
+            TextField("Name", text: $newFolderName)
+            Button("Create") {
+                let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                newFolderName = ""
+                guard !name.isEmpty else { return }
+                Task {
+                    let path = currentPath + "/" + name
+                    let ok = await adb.createDirectory(path)
+                    showStatus(ok ? "Created \"\(name)\"" : "Failed to create \"\(name)\"")
+                    if ok { loadFiles(currentPath) }
+                }
+            }
+            Button("Cancel", role: .cancel) { newFolderName = "" }
+        }
     }
 
     // MARK: - Nav Bar
@@ -170,12 +231,21 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             if adb.isConnected {
-                Button { Task { await loadFiles(currentPath) } } label: {
+                Button { loadFiles(currentPath) } label: {
                     Image(systemName: "arrow.clockwise").frame(width: 20, height: 20)
                 }
                 .buttonStyle(.borderless)
                 .disabled(isLoading)
                 .help("Refresh the current folder")
+
+                Button {
+                    newFolderName = ""
+                    showNewFolderAlert = true
+                } label: {
+                    Image(systemName: "folder.badge.plus").frame(width: 20, height: 20)
+                }
+                .buttonStyle(.borderless)
+                .help("Create a new folder")
             }
 
             Button { showHelp = true } label: {
@@ -302,10 +372,17 @@ struct ContentView: View {
         FileTableNSView(
             files: tableDisplayFiles,
             adbPath: adb.adbPath,
+            sortField: sortField,
+            sortAscending: sortAscending,
             selectedFileIDs: $selectedFileIDs,
             onNavigate: { navigate(to: $0.path) },
             onPreview: { file in Task { @MainActor in await showPreview(for: file) } },
-            onDrop: handleDrop
+            onDrop: handleDrop,
+            onCreateFolder: { newFolderName = ""; showNewFolderAlert = true },
+            onDelete: requestDelete,
+            onSortChange: { field, ascending in
+                tableSortOrder = [makeComparator(field: field, ascending: ascending)]
+            }
         )
     }
 
@@ -319,7 +396,9 @@ struct ContentView: View {
             selectedFileIDs: $selectedFileIDs,
             isDropTargeted: $isDropTargeted,
             onNavigate: { navigate(to: $0.path) },
-            onDrop: handleDrop
+            onDrop: handleDrop,
+            onCreateFolder: { newFolderName = ""; showNewFolderAlert = true },
+            onDelete: requestDelete
         )
     }
 
@@ -348,23 +427,27 @@ struct ContentView: View {
         pathHistory.append(currentPath)
         currentPath = path
         selectedFileIDs = []
-        Task { await loadFiles(path) }
+        loadFiles(path)
     }
 
     private func navigateBack() {
         guard let prev = pathHistory.popLast() else { return }
         currentPath = prev
         selectedFileIDs = []
-        Task { await loadFiles(prev) }
+        loadFiles(prev)
     }
 
-    private func loadFiles(_ path: String) async {
-        isLoading = true
-        files = []
-        for await batch in adb.listFilesStream(path: path) {
-            files.append(contentsOf: batch)
+    private func loadFiles(_ path: String) {
+        loadingTask?.cancel()
+        loadingTask = Task { @MainActor in
+            isLoading = true
+            files = []
+            for await batch in adb.listFilesStream(path: path) {
+                guard !Task.isCancelled else { break }
+                files.append(contentsOf: batch)
+            }
+            if !Task.isCancelled { isLoading = false }
         }
-        isLoading = false
     }
 
     private func pollForDevice() async {
@@ -383,11 +466,52 @@ struct ContentView: View {
                 Task { @MainActor in
                     let ok = await adb.pushFile(from: url, to: remotePath)
                     showStatus(ok ? "Uploaded \(url.lastPathComponent)" : "Failed to upload \(url.lastPathComponent)")
-                    if ok { await loadFiles(dest) }
+                    loadFiles(dest)
                 }
             }
         }
         return !providers.isEmpty
+    }
+
+    private func nextPreviewableFile(after file: FileItem) -> FileItem? {
+        let list = previewableFiles
+        guard let idx = list.firstIndex(where: { $0.id == file.id }) else { return nil }
+        if idx + 1 < list.count { return list[idx + 1] }
+        if idx - 1 >= 0 { return list[idx - 1] }
+        return nil
+    }
+
+    private func nextDisplayFile(after file: FileItem) -> FileItem? {
+        let list = viewMode == .list ? tableDisplayFiles : sortedFiles
+        guard let idx = list.firstIndex(where: { $0.id == file.id }) else { return nil }
+        if idx + 1 < list.count { return list[idx + 1] }
+        if idx - 1 >= 0 { return list[idx - 1] }
+        return nil
+    }
+
+    private func requestDelete(_ files: [FileItem]) {
+        guard !files.isEmpty else { return }
+        if files.count == 1 {
+            let file = files[0]
+            let wasPreviewOpen = previewURL != nil
+            let nextFile = wasPreviewOpen ? nextPreviewableFile(after: file) : nextDisplayFile(after: file)
+            Task {
+                let ok = await adb.deleteFiles([file.path])
+                showStatus(ok ? "Deleted \"\(file.name)\"" : "Could not delete \"\(file.name)\"")
+                if wasPreviewOpen { previewURL = nil }
+                if let next = nextFile {
+                    selectedFileIDs = [next.id]
+                    if wasPreviewOpen { await showPreview(for: next) }
+                } else {
+                    selectedFileIDs = []
+                }
+                loadFiles(currentPath)
+            }
+        } else {
+            pendingDeleteNextFile = nil
+            pendingDeleteFiles = files
+            showDeleteConfirmation = true
+        }
     }
 
     private func showStatus(_ msg: String) {
@@ -400,6 +524,22 @@ struct ContentView: View {
 
     // MARK: - Quick Look / Double-click / Spacebar
 
+    // Files that can be previewed, in display order (directories excluded).
+    private var previewableFiles: [FileItem] {
+        tableDisplayFiles.filter { !$0.isDirectory }
+    }
+
+    private func navigatePreview(by delta: Int) {
+        let list = previewableFiles
+        guard let currentID = selectedFileIDs.first,
+              let idx = list.firstIndex(where: { $0.id == currentID }) else { return }
+        let newIdx = idx + delta
+        guard newIdx >= 0 && newIdx < list.count else { return }
+        let file = list[newIdx]
+        selectedFileIDs = [file.id]
+        Task { @MainActor in await showPreview(for: file) }
+    }
+
     private func setupKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             if event.keyCode == 49 { // spacebar
@@ -409,6 +549,23 @@ struct ContentView: View {
                     } else if let file = self.selectedFile, !file.isDirectory {
                         await self.showPreview(for: file)
                     }
+                }
+                return nil
+            }
+            if self.previewURL != nil {
+                if event.keyCode == 126 { // up arrow
+                    Task { @MainActor in self.navigatePreview(by: -1) }
+                    return nil
+                }
+                if event.keyCode == 125 { // down arrow
+                    Task { @MainActor in self.navigatePreview(by: 1) }
+                    return nil
+                }
+            }
+            if event.keyCode == 51 && event.modifierFlags.contains(.command) { // ⌘+Delete
+                Task { @MainActor in
+                    let selected = self.files.filter { self.selectedFileIDs.contains($0.id) }
+                    if !selected.isEmpty { self.requestDelete(selected) }
                 }
                 return nil
             }

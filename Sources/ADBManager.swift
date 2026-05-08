@@ -110,6 +110,40 @@ class ADBManager: ObservableObject {
         }
     }
 
+    func deleteFiles(_ paths: [String]) async -> Bool {
+        let adbPath = self.adbPath
+        return await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var allOk = true
+                for path in paths {
+                    // Wrap in single quotes so the Android shell handles spaces/special chars.
+                    // Escape any literal single quotes inside the path.
+                    let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                    let output = Self.runCommand(adbPath, args: ["shell", "rm -rf \(quoted)"])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    // Successful rm -rf is always silent; any output means an error.
+                    if !output.isEmpty { allOk = false }
+                }
+                cont.resume(returning: allOk)
+            }
+        }
+    }
+
+    func createDirectory(_ path: String) async -> Bool {
+        let adbPath = self.adbPath
+        return await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let output = Self.runCommand(adbPath, args: ["shell", "mkdir", path])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let lower = output.lowercased()
+                let failed = lower.contains("error") || lower.contains("permission denied")
+                          || lower.contains("failed") || lower.contains("exists")
+                          || lower.contains("cannot") || lower.contains("read-only")
+                cont.resume(returning: !failed)
+            }
+        }
+    }
+
     // MARK: - Static helpers
 
     static func runCommand(_ executablePath: String, args: [String]) -> String {
