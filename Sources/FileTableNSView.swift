@@ -20,6 +20,9 @@ struct FileTableNSView: NSViewRepresentable {
     let onCreateFolder: () -> Void
     let onDelete: ([FileItem]) -> Void
     let onSortChange: (SortField, Bool) -> Void
+    let onDownloadStart: (Int) -> Void
+    let onFileDownloaded: (String) -> Void
+    let onDownloadEnd: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -78,6 +81,10 @@ struct FileTableNSView: NSViewRepresentable {
         // Children per directory path. Persists as a cache — never cleared.
         private var childCache: [String: [FileItem]] = [:]
         private var loadingPaths: Set<String> = []
+        private var downloadTotal = 0
+        private var downloadCompleted = 0
+        private var springLoadTimer: Timer?
+        private var springLoadRow = -1
         private var suppressSelectionCallback = false
         private var suppressSortCallback = false
         private var lastSortKey: String = "name"
@@ -344,27 +351,53 @@ struct FileTableNSView: NSViewRepresentable {
             guard let info = filePromiseProvider.userInfo as? [String: String],
                   let remotePath = info["remotePath"],
                   let adbPath = info["adbPath"] else {
+                DispatchQueue.main.async { self.handleDownloadComplete(fileName: "") }
                 completionHandler(NSError(domain: "transfer", code: -1, userInfo: nil))
                 return
             }
+            let fileName = info["fileName"] ?? ""
             let out = ADBManager.runCommand(adbPath, args: ["pull", remotePath, url.path])
             let ok = out.contains("pulled") || out.contains("file pulled")
+            DispatchQueue.main.async { self.handleDownloadComplete(fileName: fileName) }
             completionHandler(ok ? nil : NSError(domain: "adb", code: -1,
                                                  userInfo: [NSLocalizedDescriptionKey: out]))
         }
 
         // MARK: Drop Destination (Mac → Android)
 
+        private func cancelSpringLoad() {
+            springLoadTimer?.invalidate()
+            springLoadTimer = nil
+            springLoadRow = -1
+        }
+
         func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
                        proposedRow row: Int,
                        proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
             guard info.draggingSource as? NSTableView !== tableView else { return [] }
-            tableView.setDropRow(-1, dropOperation: .on)
+            if row >= 0, row < flatRows.count, flatRows[row].file.isDirectory {
+                // Hovering over a folder — highlight it and spring-load after a short pause.
+                tableView.setDropRow(row, dropOperation: .on)
+                if row != springLoadRow {
+                    cancelSpringLoad()
+                    springLoadRow = row
+                    let file = flatRows[row].file
+                    springLoadTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+                        guard let self else { return }
+                        self.springLoadRow = -1
+                        self.parent.onNavigate(file)
+                    }
+                }
+            } else {
+                tableView.setDropRow(-1, dropOperation: .on)
+                cancelSpringLoad()
+            }
             return .copy
         }
 
         func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
                        row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+            cancelSpringLoad()
             let pb = info.draggingPasteboard
             guard let urls = pb.readObjects(forClasses: [NSURL.self],
                                             options: [.urlReadingFileURLsOnly: true]) as? [URL],
@@ -375,6 +408,37 @@ struct FileTableNSView: NSViewRepresentable {
                 return p
             }
             return parent.onDrop(providers)
+        }
+
+        // MARK: Drag Session (download progress)
+
+        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                       willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+            let count = rowIndexes.reduce(0) { acc, row in
+                (row < flatRows.count && !flatRows[row].file.isDirectory) ? acc + 1 : acc
+            }
+            guard count > 0 else { return }
+            downloadTotal = count
+            downloadCompleted = 0
+            DispatchQueue.main.async { self.parent.onDownloadStart(count) }
+        }
+
+        func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                       endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+            guard operation == [], downloadTotal > 0 else { return }
+            downloadTotal = 0
+            downloadCompleted = 0
+            DispatchQueue.main.async { self.parent.onDownloadEnd() }
+        }
+
+        private func handleDownloadComplete(fileName: String) {
+            downloadCompleted += 1
+            parent.onFileDownloaded(fileName)
+            if downloadCompleted >= downloadTotal, downloadTotal > 0 {
+                downloadTotal = 0
+                downloadCompleted = 0
+                parent.onDownloadEnd()
+            }
         }
 
         // MARK: Selection

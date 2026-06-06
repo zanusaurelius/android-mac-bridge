@@ -1,8 +1,18 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 import QuickLook
 
 enum ViewMode { case list, grid }
+
+private struct TransferState {
+    var label: String
+    var current: Int
+    var total: Int
+    var currentFile: String
+}
+
+private enum ConflictResolution { case replace, keepBoth, skip }
 
 enum SortField: CaseIterable {
     case name, date, size
@@ -19,6 +29,7 @@ struct ContentView: View {
     @State private var pathHistory: [String] = []
     @State private var isLoading = false
     @State private var statusMessage: String? = nil
+    @State private var transferState: TransferState? = nil
     @State private var isDropTargeted = false
 
     @State private var viewMode: ViewMode = .list
@@ -44,6 +55,18 @@ struct ContentView: View {
     var selectedFile: FileItem? {
         guard selectedFileIDs.count == 1, let id = selectedFileIDs.first else { return nil }
         return files.first { $0.id == id }
+    }
+
+    private var selectionSummary: String? {
+        guard selectedFileIDs.count > 1 else { return nil }
+        let count = selectedFileIDs.count
+        // Collect sizes only for items visible in the current directory listing
+        let sizes = files.filter { selectedFileIDs.contains($0.id) }.compactMap(\.size)
+        guard !sizes.isEmpty else { return "\(count) selected" }
+        let totalBytes = sizes.reduce(0, +)
+        let fmt = ByteCountFormatter()
+        fmt.countStyle = .file
+        return "\(count) selected — \(fmt.string(fromByteCount: totalBytes))"
     }
 
     // Files shown in the Table (uses tableSortOrder, directories always first)
@@ -132,7 +155,18 @@ struct ContentView: View {
                 }
                 if isLoading { loadingOverlay }
             }
-            if let msg = statusMessage {
+            if let ts = transferState {
+                Divider()
+                VStack(alignment: .leading, spacing: 2) {
+                    ProgressView(value: Double(ts.current), total: Double(ts.total))
+                        .progressViewStyle(.linear)
+                    Text("\(ts.label) \(ts.current) of \(ts.total)\(ts.currentFile.isEmpty ? "" : " — \(ts.currentFile)")")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            } else if let msg = statusMessage {
                 Divider()
                 HStack {
                     Text(msg).font(.caption).foregroundColor(.secondary)
@@ -318,6 +352,16 @@ struct ContentView: View {
 
             Spacer()
 
+            if let summary = selectionSummary {
+                Text(summary)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.accentColor.opacity(0.1))
+                    .cornerRadius(4)
+            }
+
             Button {
                 showHiddenFiles.toggle()
             } label: {
@@ -382,6 +426,16 @@ struct ContentView: View {
             onDelete: requestDelete,
             onSortChange: { field, ascending in
                 tableSortOrder = [makeComparator(field: field, ascending: ascending)]
+            },
+            onDownloadStart: { count in
+                transferState = TransferState(label: "Downloading", current: 0, total: count, currentFile: "")
+            },
+            onFileDownloaded: { name in
+                transferState?.current += 1
+                transferState?.currentFile = name
+            },
+            onDownloadEnd: {
+                transferState = nil
             }
         )
     }
@@ -457,20 +511,95 @@ struct ContentView: View {
         }
     }
 
+    // Recursively expand dropped URLs into (localURL, remotePath) pairs.
+    // Directories are walked; individual files are added directly.
+    private func collectTransfers(url: URL, remoteDir: String) -> [(local: URL, remote: String)] {
+        var isDirObjC: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirObjC) else { return [] }
+        let remotePath = remoteDir + "/" + url.lastPathComponent
+        guard isDirObjC.boolValue else { return [(url, remotePath)] }
+        let children = (try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        )) ?? []
+        return children.flatMap { collectTransfers(url: $0, remoteDir: remotePath) }
+    }
+
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard !providers.isEmpty else { return false }
         let dest = currentPath
-        for provider in providers {
+        Task { @MainActor in
+            // Resolve URLs, then expand any directories into individual files
+            var transfers: [(local: URL, remote: String)] = []
+            for provider in providers {
+                guard let url = await resolveURL(from: provider) else { continue }
+                transfers.append(contentsOf: collectTransfers(url: url, remoteDir: dest))
+            }
+            let total = transfers.count
+            transferState = TransferState(label: "Uploading", current: 0, total: max(total, 1), currentFile: "")
+            var successCount = 0
+            let currentListing = files
+            for (localURL, remotePath) in transfers {
+                let fileName = localURL.lastPathComponent
+                transferState?.currentFile = fileName
+                await adb.ensureDirectory((remotePath as NSString).deletingLastPathComponent)
+                var finalRemotePath = remotePath
+                let remoteParent = (remotePath as NSString).deletingLastPathComponent
+                let alreadyExists: Bool
+                if remoteParent == dest {
+                    alreadyExists = currentListing.contains { $0.name == fileName }
+                } else {
+                    alreadyExists = await adb.fileExists(remotePath)
+                }
+                if alreadyExists {
+                    let resolution = await awaitConflictResolution(for: fileName)
+                    switch resolution {
+                    case .replace:
+                        break
+                    case .keepBoth:
+                        finalRemotePath = await adb.findUniquePath(for: remotePath)
+                    case .skip:
+                        transferState?.current += 1
+                        continue
+                    }
+                }
+                let ok = await adb.pushFile(from: localURL, to: finalRemotePath)
+                if ok { successCount += 1 }
+                transferState?.current += 1
+            }
+            transferState = nil
+            showStatus("\(successCount) of \(total) file\(total == 1 ? "" : "s") uploaded")
+            loadFiles(dest)
+        }
+        return true
+    }
+
+    private func resolveURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { cont in
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                guard let url = url else { return }
-                let remotePath = dest + "/" + url.lastPathComponent
-                Task { @MainActor in
-                    let ok = await adb.pushFile(from: url, to: remotePath)
-                    showStatus(ok ? "Uploaded \(url.lastPathComponent)" : "Failed to upload \(url.lastPathComponent)")
-                    loadFiles(dest)
+                cont.resume(returning: url)
+            }
+        }
+    }
+
+    @MainActor
+    private func awaitConflictResolution(for filename: String) async -> ConflictResolution {
+        await withCheckedContinuation { continuation in
+            // Dispatch after suspension so the main thread is free when runModal() blocks.
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "File Already Exists"
+                alert.informativeText = "\"\(filename)\" already exists in this location. Do you want to replace it, keep both, or skip it?"
+                alert.addButton(withTitle: "Replace")
+                alert.addButton(withTitle: "Keep Both")
+                alert.addButton(withTitle: "Skip")
+                let response = alert.runModal()
+                switch response {
+                case .alertFirstButtonReturn:  continuation.resume(returning: .replace)
+                case .alertSecondButtonReturn: continuation.resume(returning: .keepBoth)
+                default:                       continuation.resume(returning: .skip)
                 }
             }
         }
-        return !providers.isEmpty
     }
 
     private func nextPreviewableFile(after file: FileItem) -> FileItem? {

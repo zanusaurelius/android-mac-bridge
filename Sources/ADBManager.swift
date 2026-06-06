@@ -54,7 +54,8 @@ class ADBManager: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: adbPath)
-                process.arguments = ["shell", "ls", "-la", path]
+                let quotedPath = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                process.arguments = ["shell", "ls -la \(quotedPath)"]
 
                 let pipe = Pipe()
                 process.standardOutput = pipe
@@ -125,6 +126,44 @@ class ADBManager: ObservableObject {
                     if !output.isEmpty { allOk = false }
                 }
                 cont.resume(returning: allOk)
+            }
+        }
+    }
+
+    func fileExists(_ path: String) async -> Bool {
+        let adbPath = self.adbPath
+        return await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                let output = Self.runCommand(adbPath, args: ["shell", "test -e \(quoted) && echo yes"])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                cont.resume(returning: output.contains("yes"))
+            }
+        }
+    }
+
+    // Returns a path that doesn't exist yet by appending " (2)", " (3)", etc. before the extension.
+    func findUniquePath(for path: String) async -> String {
+        let ext = (path as NSString).pathExtension
+        let base = (path as NSString).deletingPathExtension
+        var counter = 2
+        while counter < 100 {
+            let candidate = ext.isEmpty ? "\(base) (\(counter))" : "\(base) (\(counter)).\(ext)"
+            if !(await fileExists(candidate)) { return candidate }
+            counter += 1
+        }
+        return path
+    }
+
+    // Creates a remote directory and all its parents (like mkdir -p). Used before pushing
+    // individual files inside a recursively-expanded directory tree.
+    func ensureDirectory(_ path: String) async {
+        let adbPath = self.adbPath
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                _ = Self.runCommand(adbPath, args: ["shell", "mkdir -p \(quoted)"])
+                cont.resume()
             }
         }
     }
@@ -230,7 +269,8 @@ class ADBManager: ObservableObject {
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: adbPath)
-                process.arguments = ["shell", "ls", "-F", path]
+                let quotedPath = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                process.arguments = ["shell", "ls -F \(quotedPath)"]
                 let pipe = Pipe()
                 process.standardOutput = pipe
                 process.standardError = Pipe()
@@ -270,7 +310,8 @@ class ADBManager: ObservableObject {
 
     // Fast listing for tree expansion — names + directory flag only
     static func listDirFast(_ adbPath: String, path: String) -> [FileItem] {
-        let output = runCommand(adbPath, args: ["shell", "ls", "-F", path])
+        let quotedPath = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let output = runCommand(adbPath, args: ["shell", "ls -F \(quotedPath)"])
         let base = path.hasSuffix("/") ? String(path.dropLast()) : path
         return output.components(separatedBy: "\n").compactMap { line in
             var name = line.trimmingCharacters(in: .whitespacesAndNewlines)
