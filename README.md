@@ -65,6 +65,9 @@ The app detects your phone automatically and your files appear. No button to pre
 - Sort by name, date, or size
 - Show or hide hidden files
 
+<img width="982" height="706" alt="Screenshot 2026-06-06 at 9 37 41 PM" src="https://github.com/user-attachments/assets/b5499f5c-9a17-4117-8f1b-293201512fe8" />
+<img width="982" height="708" alt="Screenshot 2026-06-06 at 9 38 35 PM" src="https://github.com/user-attachments/assets/3cb8cc63-3f5c-4721-b17c-9db99099f49c" />
+
 ---
 
 ## Troubleshooting
