@@ -4,6 +4,9 @@ A native macOS app for transferring files between your Android phone and Mac ove
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
+<img width="982" height="706" alt="Screenshot 2026-06-06 at 9 37 41 PM" src="https://github.com/user-attachments/assets/b5499f5c-9a17-4117-8f1b-293201512fe8" />
+<img width="982" height="708" alt="Screenshot 2026-06-06 at 9 38 35 PM" src="https://github.com/user-attachments/assets/3cb8cc63-3f5c-4721-b17c-9db99099f49c" />
+
 ---
 
 ## Install
@@ -64,9 +67,6 @@ The app detects your phone automatically and your files appear. No button to pre
 - **Spacebar preview** (Quick Look) for photos and videos
 - Sort by name, date, or size
 - Show or hide hidden files
-
-<img width="982" height="706" alt="Screenshot 2026-06-06 at 9 37 41 PM" src="https://github.com/user-attachments/assets/b5499f5c-9a17-4117-8f1b-293201512fe8" />
-<img width="982" height="708" alt="Screenshot 2026-06-06 at 9 38 35 PM" src="https://github.com/user-attachments/assets/3cb8cc63-3f5c-4721-b17c-9db99099f49c" />
 
 ---
 
